@@ -1,402 +1,292 @@
 # src/app/core/db.py
 import asyncio
 import logging
-import anyio
 import random
 from datetime import datetime, timedelta
-from typing import AsyncGenerator, Generator, Optional, Callable, Any
+from typing import AsyncGenerator, Generator, Optional
 from contextlib import suppress
 
-import hvac
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, DBAPIError
-from sqlalchemy import text, create_engine
+from sqlalchemy import create_engine, text
 from sqlmodel import SQLModel
 from redis.asyncio import Redis as AsyncRedis
 from redis import Redis as SyncRedis
 from minio import Minio
+import anyio
 
 from src.app.core.config import settings
 
-# -------------------------
+# ------------------------
 # Logger
 # -------------------------
-logger = logging.getLogger("bank_db")
+logger = logging.getLogger("db_core")
 logger.setLevel(logging.DEBUG if settings.MODE == "development" else logging.INFO)
-ch = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-ch.setFormatter(formatter)
 if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     logger.addHandler(ch)
-
-# -------------------------
-# Vault client (sync hvac)
-# -------------------------
-vault_client = hvac.Client(url=settings.VAULT_URL, token=settings.VAULT_TOKEN)
 
 # -------------------------
 # Globals
 # -------------------------
-MAIN_DATABASE_URL: str = ""
-EXPERIMENT_DATABASE_URL: str = ""
 async_engine: Optional[AsyncEngine] = None
 async_session_factory: Optional[sessionmaker] = None
+
 sync_engine: Optional[create_engine] = None
 sync_session_factory: Optional[sessionmaker] = None
+
 async_redis: Optional[AsyncRedis] = None
 sync_redis: Optional[SyncRedis] = None
+
 minio_client: Optional[Minio] = None
-VECTOR_DB_API_KEY: str = ""
-_rotate_task: Optional[asyncio.Task] = None
+VECTOR_DB_API_KEY: Optional[str] = None
 DB_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_rotate_task: Optional[asyncio.Task] = None
 
-# secret cache
-_secret_cache: dict = {}  # key -> (value, expires_at)
+_secret_cache: dict = {}  # vault ephemeral secret cache
 
 # -------------------------
-# Helpers: non-blocking vault read + cache
+# Vault helpers
 # -------------------------
-async def _sync_vault_read(path: str) -> dict:
-    """Run hvac read in threadpool (sync)"""
-    def read():
-        return vault_client.secrets.kv.v2.read_secret_version(path=path)
-    return await anyio.to_thread.run_sync(read)
-
-async def get_ephemeral_secret(path: str, key: str, ttl_seconds: int = 300) -> str:
-    """
-    - Non-blocking vault read
-    - Simple in-process cache with safety margin
-    """
+async def _vault_read(path: str, key: str, ttl: int = 300) -> str:
+    """Non-blocking read with in-memory cache"""
     cache_key = f"{path}:{key}"
     now = datetime.utcnow()
     cached = _secret_cache.get(cache_key)
     if cached:
-        value, expires_at = cached
-        if now < expires_at:
+        value, expires = cached
+        if now < expires:
             return value
 
-    read = await _sync_vault_read(path)
-    value = read["data"]["data"][key]
-    # cache with safety margin 10%
-    expires_at = now + timedelta(seconds=int(ttl_seconds * 0.9))
+    data = await settings.fetch_vault_secret_async(path)
+    value = data.get(key)
+    expires_at = now + timedelta(seconds=int(ttl * 0.9))
     _secret_cache[cache_key] = (value, expires_at)
     return value
 
 # -------------------------
-# Retry decorator for async funcs
+# Retry decorator
 # -------------------------
 def retry_async(max_attempts: int = 3, base_delay: float = 0.5):
-    def deco(func: Callable):
-        async def wrapper(*a, **kw):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
             delay = base_delay
             for attempt in range(1, max_attempts + 1):
                 try:
-                    return await func(*a, **kw)
+                    return await func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_attempts:
                         raise
                     await asyncio.sleep(delay)
                     delay *= 2
         return wrapper
-    return deco
+    return decorator
 
 # -------------------------
-# Create engines (return new instances, do not swap globals here)
+# Async Engine
 # -------------------------
 def _build_async_engine(db_url: str) -> AsyncEngine:
     return create_async_engine(
-        url=db_url,
-        echo=(settings.MODE == "development"),
+        db_url,
+        echo=settings.MODE == "development",
         pool_size=settings.POOL_SIZE,
         max_overflow=5,
         pool_timeout=30,
         pool_recycle=1800,
         pool_pre_ping=True,
         future=True,
-        connect_args={"sslmode": "require"} if settings.MODE == "production" else {},
     )
 
+async def _validate_async_engine(engine: AsyncEngine):
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+
+@retry_async()
+async def create_async_db_engine() -> None:
+    """Create async engine using Vault secrets"""
+    global async_engine, async_session_factory, DB_SEMAPHORE
+
+    user = await _vault_read(settings.VAULT_DB_MAIN_PATH, "username")
+    password = await _vault_read(settings.VAULT_DB_MAIN_PATH, "password")
+    host = settings.DATABASE_HOST
+    port = settings.DATABASE_PORT
+    db = settings.DATABASE_NAME
+
+    url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}"
+    engine = _build_async_engine(url)
+    session_factory = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False, future=True)
+
+    await _validate_async_engine(engine)
+
+    old_engine = async_engine
+    async_engine = engine
+    async_session_factory = session_factory
+
+    if DB_SEMAPHORE is None:
+        DB_SEMAPHORE = asyncio.Semaphore(settings.POOL_SIZE)
+
+    if old_engine:
+        with suppress(Exception):
+            await old_engine.dispose()
+
+# -------------------------
+# Sync Engine (experiment DB)
+# -------------------------
 def _build_sync_engine(db_url: str):
     return create_engine(
-        url=db_url,
-        echo=(settings.MODE == "development"),
+        db_url,
+        echo=settings.MODE == "development",
         pool_size=max(settings.POOL_SIZE // 2, 5),
         max_overflow=5,
         pool_timeout=30,
         pool_recycle=1800,
         pool_pre_ping=True,
         future=True,
-        connect_args={"sslmode": "require"} if settings.MODE == "production" else {},
     )
 
-# -------------------------
-# Validate engine by a lightweight probe
-# -------------------------
-async def _validate_async_engine(engine: AsyncEngine) -> None:
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
-
-def _validate_sync_engine(engine) -> None:
+def _validate_sync_engine(engine):
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
 
-# -------------------------
-# Functions that create & atomically swap global engines
-# -------------------------
-async def create_async_db_engine() -> None:
-    """
-    Build a new async engine using current Vault secrets, validate it,
-    then atomically swap globals. Non-blocking Vault reads used.
-    """
-    global MAIN_DATABASE_URL, async_engine, async_session_factory, DB_SEMAPHORE
+def create_sync_db_engine():
+    global sync_engine, sync_session_factory
+    user = settings.DATABASE_USER
+    password = settings.DATABASE_PASSWORD
+    host = settings.DATABASE_HOST
+    port = settings.DATABASE_PORT
+    db = settings.EXPERIMENT_DB_NAME or "experiment"
 
-    db_user = await get_ephemeral_secret(settings.VAULT_DB_MAIN_PATH, "username")
-    db_pass = await get_ephemeral_secret(settings.VAULT_DB_MAIN_PATH, "password")
-    new_url = f"postgresql+asyncpg://{db_user}:{db_pass}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
-
-    new_engine = _build_async_engine(new_url)
-    new_session_factory = sessionmaker(
-        bind=new_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        autoflush=False,
-        future=True,
-    )
-
-    # validate before swap
-    try:
-        await _validate_async_engine(new_engine)
-    except Exception:
-        await new_engine.dispose()
-        logger.exception("Validation failed for new async engine")
-        raise
-
-    # atomic swap
-    old_engine = async_engine
-    async_engine = new_engine
-    async_session_factory = new_session_factory
-    MAIN_DATABASE_URL = new_url
-
-    # update DB semaphore if not set
-    if DB_SEMAPHORE is None:
-        DB_SEMAPHORE = asyncio.Semaphore(settings.POOL_SIZE)
-
-    # gracefully dispose old engine
-    if old_engine is not None:
-        try:
-            await old_engine.dispose()
-        except Exception:
-            logger.exception("Error disposing old async engine")
-
-def create_sync_db_engine() -> None:
-    """
-    Build & swap sync engine for experiment DB
-    """
-    global EXPERIMENT_DATABASE_URL, sync_engine, sync_session_factory
-
-    # sync vault reads (these are blocking) -> run in thread if startup called inside eventloop
-    read_user = vault_client.secrets.kv.v2.read_secret_version(path=settings.VAULT_DB_MAIN_PATH)
-    db_user = read_user["data"]["data"]["username"]
-    read_exp = vault_client.secrets.kv.v2.read_secret_version(path=settings.VAULT_DB_EXP_PATH)
-    db_pass = read_exp["data"]["data"]["password"]
-
-    new_url = f"postgresql+psycopg2://{db_user}:{db_pass}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.EXPERIMENT_DB_NAME}"
-    new_engine = _build_sync_engine(new_url)
-    new_session_factory = sessionmaker(
-        bind=new_engine,
-        autoflush=False,
-        autocommit=False,
-        future=True,
-    )
-
-    # validate
-    try:
-        _validate_sync_engine(new_engine)
-    except Exception:
-        with suppress(Exception):
-            new_engine.dispose()
-        logger.exception("Validation failed for new sync engine")
-        raise
-
-    old_engine = sync_engine
-    sync_engine = new_engine
-    sync_session_factory = new_session_factory
-    EXPERIMENT_DATABASE_URL = new_url
-
-    if old_engine is not None:
-        with suppress(Exception):
-            old_engine.dispose()
+    url = f"postgresql://{user}:{password}@{host}:{port}/{db}"
+    engine = _build_sync_engine(url)
+    _validate_sync_engine(engine)
+    sync_engine = engine
+    sync_session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # -------------------------
-# Session providers
+# Session Providers (FastAPI DI)
 # -------------------------
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     if async_session_factory is None:
         await create_async_db_engine()
-    # semaphore for DB concurrency control (per process)
-    assert DB_SEMAPHORE is not None, "DB_SEMAPHORE not initialized"
+    assert DB_SEMAPHORE is not None
     async with DB_SEMAPHORE:
         async with async_session_factory() as session:
             try:
                 yield session
-            except (SQLAlchemyError, DBAPIError) as e:
-                logger.error("Main DB session error: %s", e)
+            except Exception:
                 await session.rollback()
                 raise
             finally:
                 await session.close()
 
-def get_experiment_session() -> Generator:
+def get_sync_session() -> Generator:
     if sync_session_factory is None:
         create_sync_db_engine()
     with sync_session_factory() as session:
         try:
             yield session
-        except (SQLAlchemyError, DBAPIError) as e:
-            logger.error("Experiment DB session error: %s", e)
+        except Exception:
             session.rollback()
             raise
         finally:
             session.close()
 
 # -------------------------
-# Services setup (Redis, MinIO, VectorDB)
+# Redis / MinIO / VectorDB
 # -------------------------
-async def setup_services() -> None:
+@retry_async()
+async def init_services():
     global async_redis, sync_redis, minio_client, VECTOR_DB_API_KEY
 
-    redis_pass = await get_ephemeral_secret(settings.VAULT_REDIS_PATH, "password")
-    async_redis = AsyncRedis.from_url(settings.REDIS_URL, decode_responses=True, ssl=True, password=redis_pass)
-    sync_redis = SyncRedis.from_url(settings.REDIS_URL, decode_responses=True, ssl=True, password=redis_pass)
+    # Redis
+    redis_pass = await _vault_read(settings.VAULT_REDIS_PATH, "password")
+    url = settings.REDIS_URL or f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+    async_redis = AsyncRedis.from_url(url, decode_responses=True, ssl=True, password=redis_pass)
+    sync_redis = SyncRedis.from_url(url, decode_responses=True, ssl=True, password=redis_pass)
 
-    minio_secret = await get_ephemeral_secret(settings.VAULT_MINIO_PATH, "secret_key")
+    # MinIO
+    minio_secret = await _vault_read(settings.VAULT_MINIO_PATH, "secret_key")
     minio_client = Minio(
         endpoint=settings.MINIO_URL,
         access_key=settings.MINIO_ROOT_USER,
         secret_key=minio_secret,
-        secure=True,
+        secure=True
     )
 
-    VECTOR_DB_API_KEY = await get_ephemeral_secret(settings.VAULT_VECTOR_PATH, "api_key")
+    # VectorDB
+    VECTOR_DB_API_KEY = await _vault_read(settings.VAULT_VECTOR_PATH, "api_key")
 
 # -------------------------
-# Secret rotation: jitter + backoff + circuit-breaker alerting
+# Secret rotation
 # -------------------------
-async def rotate_secrets_periodically(interval_sec: int = 60, max_consecutive_fail: int = 5):
-    """
-    Background task: rotates secrets periodically.
-    Uses jitter on interval, exponential backoff on failure, and opens a 'circuit'
-    (just logs and optionally could notify) if many consecutive failures occur.
-    """
+async def rotate_secrets(interval_sec: int = 300):
     consecutive_fail = 0
     backoff = 1.0
-
     while True:
-        # jittered sleep to avoid thundering herd across instances
         jitter = random.uniform(-0.2, 0.2) * interval_sec
-        await asyncio.sleep(max(0.0, interval_sec + jitter))
+        await asyncio.sleep(max(0, interval_sec + jitter))
         try:
-            # create engines + services using latest secrets and swap atomically
             await create_async_db_engine()
-            # sync engine creation may block; run in thread
-            await anyio.to_thread.run_sync(create_sync_db_engine)
-            await setup_services()
-
-            logger.info("Ephemeral secrets rotated at %s", datetime.utcnow().isoformat())
+            await init_services()
+            logger.info("Secrets rotated at %s", datetime.utcnow().isoformat())
             consecutive_fail = 0
             backoff = 1.0
         except asyncio.CancelledError:
-            logger.info("rotate_secrets_periodically cancelled")
+            logger.info("Secret rotation cancelled")
             raise
         except Exception as e:
             consecutive_fail += 1
-            logger.error("Error rotating secrets: %s (consecutive %d)", e, consecutive_fail)
-            # exponential backoff on repeated failures
+            logger.error("Secret rotation error: %s (consecutive %d)", e, consecutive_fail)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-            if consecutive_fail >= max_consecutive_fail:
-                logger.critical("Secret rotation failing %d times: open circuit & alert ops", consecutive_fail)
-                # TODO: integrate with alerting/ops here (PagerDuty/Sentry/email)
-                # After alerting we keep trying but with larger backoff
+            backoff = min(backoff * 2, 60)
+            if consecutive_fail >= 5:
+                logger.critical("Secret rotation failing consecutively: alert ops")
                 await asyncio.sleep(30)
-                consecutive_fail = 0  # optionally reset after alert
+                consecutive_fail = 0
 
 # -------------------------
-# DB Initialization helpers
+# Initialize DB tables
 # -------------------------
-async def init_main_db() -> None:
+async def init_db():
     if async_engine is None:
         await create_async_db_engine()
     async with async_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
-    logger.info("Main async DB initialized")
+    logger.info("Async DB initialized")
 
-def init_experiment_db() -> None:
+def init_sync_db():
     if sync_engine is None:
         create_sync_db_engine()
+        from src.app.model.user import User
     SQLModel.metadata.create_all(bind=sync_engine)
-    logger.info("Experiment DB initialized")
-
-async def init_all_dbs() -> None:
-    await init_main_db()
-    await anyio.to_thread.run_sync(init_experiment_db)
-    logger.info("All databases initialized")
+    logger.info("Sync DB initialized")
 
 # -------------------------
-# Startup / Shutdown helpers for FastAPI
+# FastAPI startup / shutdown
 # -------------------------
-async def startup_security_tasks() -> None:
-    """
-    Call this in FastAPI startup event.
-    It ensures initial engines/services ready and launches rotation task.
-    """
-    global _rotate_task, DB_SEMAPHORE
-
-    # initialize engines & services once
+async def startup():
     await create_async_db_engine()
-    await anyio.to_thread.run_sync(create_sync_db_engine)
-    await setup_services()
-
-    # initialize semaphore (per-process)
-    if DB_SEMAPHORE is None:
-        DB_SEMAPHORE = asyncio.Semaphore(settings.POOL_SIZE)
-
-    # start rotation background task if not running
+    create_sync_db_engine()
+    await init_services()
+    global _rotate_task
     if _rotate_task is None or _rotate_task.done():
-        _rotate_task = asyncio.create_task(rotate_secrets_periodically(interval_sec=60))
+        _rotate_task = asyncio.create_task(rotate_secrets())
 
-async def shutdown_tasks() -> None:
-    """
-    Call this in FastAPI shutdown event.
-    """
-    global _rotate_task, async_engine, sync_engine, async_redis, sync_redis, minio_client
-
-    # cancel rotation task
+async def shutdown():
+    global async_engine, async_redis, sync_redis, minio_client, _rotate_task
     if _rotate_task:
         _rotate_task.cancel()
         with suppress(asyncio.CancelledError):
             await _rotate_task
-
-    # dispose engines and close clients
-    if async_engine is not None:
+    if async_engine:
         with suppress(Exception):
             await async_engine.dispose()
-
-    if sync_engine is not None:
-        with suppress(Exception):
-            sync_engine.dispose()
-
-    if async_redis is not None:
+    if async_redis:
         with suppress(Exception):
             await async_redis.close()
-
-    if sync_redis is not None:
+    if sync_redis:
         with suppress(Exception):
             sync_redis.close()
-
-    if minio_client is not None:
-        # minio client has no close method; rely on GC
-        pass
-
-    logger.info("Shutdown complete: DB engines disposed and services closed")
+    minio_client = None
+    logger.info("Shutdown complete")
