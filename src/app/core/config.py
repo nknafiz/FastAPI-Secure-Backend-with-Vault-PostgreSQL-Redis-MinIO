@@ -1,4 +1,4 @@
-# secure_settings.py
+# src.app.core.config.py
 import os
 import warnings
 import asyncio
@@ -26,7 +26,6 @@ def async_retry(
     max_delay: float = 5.0,
     allowed_exceptions: tuple = (Exception,),
 ):
-    """Async exponential backoff retry decorator."""
     def decorator(func: Callable[..., Coroutine[Any, Any, Any]]):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -46,21 +45,27 @@ def async_retry(
 
 
 class Settings(BaseSettings):
-    # ---------------- General ----------------
-    MODE: str = "development"
-    PROJECT_NAME: str = "MyProject"
-    API_VERSION: str = "v1"
-    API_V1_STR: str = "/api/v1"
+    # General .env load 
+    MODE: str 
+    PROJECT_NAME: str
+    API_VERSION: str
+    API_V1_STR: str 
+    JWT_ISSUER: str 
+    JWT_AUDIENCE: str 
+    IP_WHITELIST: list[str] = []         
+    IP_BLOCKLIST: list[str] = []         
+    ALLOWED_COUNTRIES: list[str] = []   
 
-    # ---------------- Security ----------------
-    SECRET_KEY: Optional[str] = None
-    ENCRYPT_KEY: Optional[str] = None
-    JWT_ALGORITHM: str = "HS256"
-    JWT_REFRESH_TOKEN_KEY: Optional[str] = None
+
+    # Security 
+    SECRET_KEY: str
+    ENCRYPT_KEY: str
+    JWT_ALGORITHM: str 
+    JWT_REFRESH_TOKEN_KEY: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 100
 
-    # ---------------- Main DB ----------------
+    # Main DB
     DATABASE_USER: Optional[str] = None
     DATABASE_PASSWORD: Optional[str] = None
     DATABASE_HOST: Optional[str] = None
@@ -69,24 +74,24 @@ class Settings(BaseSettings):
     ASYNC_DATABASE_URI: Optional[Union[PostgresDsn, str]] = None
     async_db_pool: Optional[asyncpg.pool.Pool] = None
 
-    # ---------------- Experiment DB ----------------
+    # Experiment DB
     EXPERIMENT_DB_NAME: Optional[str] = None
     SYNC_EXPERIMENT_DB_URI: Optional[Union[PostgresDsn, str]] = None
 
-    # ---------------- Redis ----------------
+    #Redis
     REDIS_HOST: Optional[str] = None
     REDIS_PORT: int = 6379
     REDIS_URL: Optional[str] = None
     redis_pool: Optional[redis.Redis] = None
 
-    # ---------------- Object Storage ----------------
+    #Object Storage
     MINIO_ROOT_USER: Optional[str] = None
     MINIO_ROOT_PASSWORD: Optional[str] = None
     MINIO_URL: Optional[str] = None
     MINIO_BUCKET: Optional[str] = None
     minio_client: Optional[Minio] = None
 
-    # ---------------- Vault ----------------
+    # Vault
     VAULT_URL: Optional[str] = None
     VAULT_TOKEN: Optional[str] = None
     VAULT_DB_MAIN_PATH: Optional[str] = None
@@ -95,19 +100,20 @@ class Settings(BaseSettings):
     VAULT_MINIO_PATH: Optional[str] = None
     VAULT_VECTOR_PATH: Optional[str] = None
 
-    # ---------------- Vector DB ----------------
+    # Vector DB
     VECTOR_DB_URL: Optional[str] = None
     VECTOR_DB_API_KEY: Optional[str] = None
 
-    # ---------------- Superuser ----------------
+    # Superuser 
     FIRST_SUPERUSER_EMAIL: Optional[str] = None
     FIRST_SUPERUSER_PASSWORD: Optional[str] = None
 
-    # ---------------- Performance ----------------
+
+    #Performance
     DB_POOL_SIZE: int = 10
     WEB_CONCURRENCY: int = 2
 
-    # ---------------- Computed ----------------
+    # Computed 
     @computed_field
     @property
     def POOL_SIZE(self) -> int:
@@ -123,7 +129,7 @@ class Settings(BaseSettings):
             raise RuntimeError("Vault authentication failed. Check VAULT_TOKEN/VAULT_URL.")
         return client
 
-    # ---------------- Load Vault Secrets ----------------
+    # Load Vault Secrets
     async def fetch_vault_secret_async(self, path: str) -> dict:
         loop = asyncio.get_running_loop()
 
@@ -201,7 +207,7 @@ class Settings(BaseSettings):
         self.VECTOR_DB_URL = vector.get("url") or self.VECTOR_DB_URL
         self.VECTOR_DB_API_KEY = vector.get("api_key") or self.VECTOR_DB_API_KEY
 
-    # ---------------- DB URI Validators ----------------
+    # ASYNC & SYNC DB URI Validators
     @field_validator("ASYNC_DATABASE_URI", mode="after")
     @classmethod
     def assemble_async_db_uri(cls, v: Optional[str], info: FieldValidationInfo) -> str:
@@ -234,7 +240,7 @@ class Settings(BaseSettings):
             path=f"{db_name}"
         ))
 
-    # ---------------- Initialize Async Connections ----------------
+    # Initialize Async Connections
     @async_retry(max_attempts=4, base_delay=0.5, max_delay=3.0)
     async def init_async_db_pool(self):
         if not self.ASYNC_DATABASE_URI:
@@ -282,7 +288,7 @@ class Settings(BaseSettings):
         )
         logger.info("All configured connections initialized.")
 
-    # ---------------- CORS ----------------
+    # CORS
     BACKEND_CORS_ORIGINS: list[str] | list[AnyHttpUrl] = []
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="after")
@@ -299,7 +305,7 @@ class Settings(BaseSettings):
     def all_cors_origins(self) -> list[str]:
         return [origin.rstrip("/") for origin in self.BACKEND_CORS_ORIGINS or []]
 
-    # ---------------- Validation ----------------
+    #Validation
     @model_validator(mode="after")
     def check_required_secrets(self) -> "Settings":
         required = {
@@ -314,7 +320,7 @@ class Settings(BaseSettings):
                 warnings.warn(f"{name} is not set. Using insecure defaults in development.")
         return self
 
-    # ---------------- Shutdown helpers ----------------
+    #Shutdown helpers 
     async def shutdown(self):
         if self.async_db_pool:
             await self.async_db_pool.close()
@@ -326,7 +332,7 @@ class Settings(BaseSettings):
             except Exception:
                 logger.exception("Error closing redis pool")
 
-    # ---------------- Model Config ----------------
+    # Model Config 
     model_config = SettingsConfigDict(
         env_file=os.path.expanduser(".env"),
         case_sensitive=True,
@@ -334,7 +340,7 @@ class Settings(BaseSettings):
     )
 
 
-# ---------------- Instantiate & Bootstrap ----------------
+# Instantiate
 settings = Settings()
 
 async def bootstrap():

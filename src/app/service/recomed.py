@@ -1,3 +1,4 @@
+#src.app.service.recomed.py
 
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ logger = logging.getLogger("recommender")
 logger.setLevel(logging.INFO)
 
 # -------- CONFIG ----------
-SESSION_KEY_FMT = "user:{user_id}:session"  # list of "<item_id>:<event_type>:<ts>"
-SESSION_TTL_SECONDS = 60 * 60 * 24  # keep session lists a day in Redis
+SESSION_KEY_FMT = "user:{user_id}:session" 
+SESSION_TTL_SECONDS = 60 * 60 * 24 
 QDRANT_COLLECTION = "items"
 DEFAULT_VECTOR_SIZE = 768
 
@@ -28,16 +29,14 @@ DEFAULT_VECTOR_SIZE = 768
 W_SIM = 0.7
 W_POP = 0.2
 W_REC = 0.1
-W_CONTENT = 0.05  # small boost for matching tags/title
-# fusion weights for session vs persistent user vector
+W_CONTENT = 0.05 
 SESSION_WEIGHT = 0.7
 PERSISTENT_WEIGHT = 0.3
 
 # mmr and exploration
 MMR_LAMBDA = 0.7
-EPSILON = 0.05  # 5% random exploration
+EPSILON = 0.05 
 
-# session weighting alpha (for exponential decay). Higher => recent items dominate.
 DEFAULT_ALPHA = 0.8
 
 # --------------------------
@@ -109,17 +108,12 @@ async def get_recent_session_items(user_id: int, n: int = 50) -> List[Tuple[int,
             parsed.append((int(item_s), event_s, int(ts_s)))
         except Exception:
             continue
-    return parsed  # newest-first (index 0 = most recent)
+    return parsed  
 
 # --- persistent user vector helpers -----------------------------------
-# expects a table user_profile_vector(user_id int primary key, vector float8[]) optional
+
 async def get_persistent_user_vector(user_id: int) -> Optional[List[float]]:
-    """
-    Fetch a persisted user vector from Postgres if available.
-    Schema expected (optional):
-      CREATE TABLE user_profile_vector (user_id int PRIMARY KEY, vector double precision[]);
-    Returns None if not present.
-    """
+
     try:
         async with get_session() as session:
             sql = text("SELECT vector FROM user_profile_vector WHERE user_id = :uid")
@@ -135,11 +129,7 @@ async def get_persistent_user_vector(user_id: int) -> Optional[List[float]]:
 async def build_user_vector_weighted_from_events(events: List[Tuple[int, str, int]],
                                                 alpha: float = DEFAULT_ALPHA,
                                                 max_items: int = 20) -> Optional[List[float]]:
-    """
-    Build user vector from session events with exponential decay by recency.
-    events: list of (item_id, event_type, ts) newest-first
-    alpha: decay factor per rank (0 < alpha <= 1). larger alpha -> faster decay.
-    """
+
     if not events:
         return None
     if qdrant_client is None:
@@ -172,7 +162,6 @@ async def build_user_vector_weighted_from_events(events: List[Tuple[int, str, in
         vec = id_to_vec.get(iid)
         if vec is None:
             continue
-        # exponential decay weight: newest (rank=0) highest weight
         w = math.exp(-alpha * rank)
         vectors.append(vec)
         weights.append(w)
@@ -236,10 +225,6 @@ async def _fetch_item_meta(session, item_ids: List[int]) -> Dict[int, Dict[str, 
 
 # --- MMR diversity selection ------------------------------------------
 def mmr_select(candidates: List[Tuple[int, float, List[float]]], k: int = 12, lambda_: float = MMR_LAMBDA):
-    """
-    candidates: list of (item_id, score, vector) where vector used for similarity between picks
-    returns chosen item_ids in order
-    """
     if not candidates:
         return []
     # clone
@@ -249,8 +234,6 @@ def mmr_select(candidates: List[Tuple[int, float, List[float]]], k: int = 12, la
         best_idx = None
         best_val = -1e9
         for idx, (iid, sc, vec) in enumerate(cand):
-            # relevance = sc
-            # diversity = max similarity to already selected
             if not selected:
                 div = 0.0
             else:
@@ -288,13 +271,7 @@ async def recommend(user_id: int,
                     epsilon: float = EPSILON,
                     sequence_reranker: Optional[Callable[[int, List[int], List[Dict[str, Any]]], List[int]]] = None
                     ) -> List[Dict[str, Any]]:
-    """
-    Main recommend function.
 
-    sequence_reranker: optional callable signature:
-       (user_id:int, session_item_ids:List[int], candidate_dicts:List[dict]) -> ordered_list_of_item_ids
-    This allows plugging in a learned sequence model (SASRec/GRU4Rec) for re-ranking.
-    """
     # 1) get session events
     session_events = await get_recent_session_items(user_id, n=50)  # newest-first
     recent_item_ids = [iid for (iid, _, _) in session_events]
@@ -340,7 +317,7 @@ async def recommend(user_id: int,
 
     # 6) compute final scoring per candidate
     now_ts = time.time()
-    scored_candidates: List[Tuple[int, float, List[float], Dict[str, Any]]] = []  # id, score, vector, payload/meta
+    scored_candidates: List[Tuple[int, float, List[float], Dict[str, Any]]] = []  
     for c in candidates_raw:
         cid = int(c["id"])
         if cid in seen_set:
@@ -356,8 +333,6 @@ async def recommend(user_id: int,
         content_boost = 0.0
         # if payload contains tags or title, give small boost if overlap with session items' payloads
         if payload:
-            # simple heuristic: boost if tag intersection with session items payloads (requires session payloads stored previously)
-            # As a cheap proxy, if payload has 'tags' or 'category' we add a small boost
             if payload.get("tags"):
                 content_boost += 0.02 * min(len(payload.get("tags", [])), 3)
             if payload.get("category"):
@@ -407,7 +382,7 @@ async def recommend(user_id: int,
                 popular_candidates = [int(r[0]) for r in rows if int(r[0]) not in seen_combined]
                 if popular_candidates:
                     choice = random.choice(popular_candidates)
-                    # replace last item with the random popular choice
+                    #  last item with the random popular choice
                     if selected_ids:
                         replaced = selected_ids[-1]
                         selected_ids[-1] = choice
@@ -435,4 +410,4 @@ async def example_usage():
     recs = await recommend(123, top_k=8)
     print("recs:", recs)
 
-# EOF
+

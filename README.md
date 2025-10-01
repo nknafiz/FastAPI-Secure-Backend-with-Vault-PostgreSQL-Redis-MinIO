@@ -33,7 +33,7 @@ Adaptive pool sizing with semaphore-based concurrency control.
 Startup & Shutdown Hooks:
 Ensures safe initialization and graceful shutdown of DB engines and external services.
 
-🚀 Technology Stack
+Technology Stack
 
 FastAPI (backend framework)
 
@@ -49,10 +49,10 @@ AnyIO + AsyncIO for concurrency
 
 ⚡ Use Cases
 
-Banking and Financial Systems 🏦
+Banking and Financial Systems 
 
-AI/ML Experiment Tracking ⚙️
+AI/ML Experiment Tracking 
 
 High-Security SaaS Applications 🔒
 
-E-Commerce Platforms with secure data handling 🛒
+E-Commerce Platforms with secure data handling 
