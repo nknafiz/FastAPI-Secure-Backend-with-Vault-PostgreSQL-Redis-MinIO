@@ -3,8 +3,9 @@
 <img src="https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png" width="260" alt="FastAPI"/>
 
 # FastAPI Secure Backend
-### by **NK. Nafiz Khan**
+### by **NK. Nafiz Khan** — Backend Engineer
 
+ 
 **A high-security, production-ready async backend** — multi-tenant user isolation, Vault-managed dynamic secrets, Redis-backed JWT blacklisting, vector-powered AI recommendations, and zero-downtime credential rotation.
 
 ---
